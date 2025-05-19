@@ -59,7 +59,7 @@ pip install "flash-attn==2.5.5" --no-build-isolation
 
 ---
 
-## 📦 Dataset Download
+## Dataset Download
 
 We use a modified version of the LIBERO dataset adapted for causal action-aware training. You can download it from Hugging Face:
 
@@ -70,7 +70,7 @@ git clone https://huggingface.co/datasets/bhatvineet/modified_libero_rlds_cotdep
 
 ---
 
-## 🚀 Fine-Tuning
+## Fine-Tuning
 
 Fine-tuning is done using the `train.sh` script. Adjust the number of GPUs and paths as needed:
 
@@ -80,7 +80,7 @@ bash train.sh
 
 ---
 
-## 🥪 Evaluation
+## Evaluation
 
 To evaluate a trained model, use the `test.sh` script:
 
@@ -90,9 +90,9 @@ bash test.sh
 
 ---
 
-## 📚 Citation
+## Citation
 
-If you use this code or dataset, please cite:
+If you use this codebase, please cite:
 
 ```bibtex
 @inproceedings{
