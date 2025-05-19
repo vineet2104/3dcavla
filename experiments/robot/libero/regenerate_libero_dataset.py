@@ -1,4 +1,6 @@
 """
+Modified to record and store agentview and eye in hand depths
+
 Regenerates a LIBERO dataset (HDF5 files) by replaying demonstrations in the environments.
 
 Notes:
@@ -95,6 +97,7 @@ def main(args):
     num_success = 0
     num_noops = 0
 
+    
     for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
         # Get task in suite
         task = task_suite.get_task(task_id)
@@ -132,6 +135,9 @@ def main(args):
             robot_states = []
             agentview_images = []
             eye_in_hand_images = []
+            # record depth
+            agentview_depths = []
+            eye_in_hand_depths = []
 
             # Replay original demo actions in environment and record observations
             for _, action in enumerate(orig_actions):
@@ -172,6 +178,10 @@ def main(args):
                 agentview_images.append(obs["agentview_image"])
                 eye_in_hand_images.append(obs["robot0_eye_in_hand_image"])
 
+                # add depth
+                agentview_depths.append(obs['agentview_depth'])
+                eye_in_hand_depths.append(obs['robot0_eye_in_hand_depth'])
+
                 # Execute demo action in environment
                 obs, reward, done, info = env.step(action.tolist())
 
@@ -192,6 +202,8 @@ def main(args):
                 obs_grp.create_dataset("ee_ori", data=np.stack(ee_states, axis=0)[:, 3:])
                 obs_grp.create_dataset("agentview_rgb", data=np.stack(agentview_images, axis=0))
                 obs_grp.create_dataset("eye_in_hand_rgb", data=np.stack(eye_in_hand_images, axis=0))
+                obs_grp.create_dataset("agentview_depth", data=np.stack(agentview_depths, axis=0))
+                obs_grp.create_dataset("eye_in_hand_depth", data=np.stack(eye_in_hand_depths, axis=0))
                 ep_data_grp.create_dataset("actions", data=actions)
                 ep_data_grp.create_dataset("states", data=np.stack(states))
                 ep_data_grp.create_dataset("robot_states", data=np.stack(robot_states, axis=0))
@@ -237,7 +249,7 @@ def main(args):
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("--libero_task_suite", type=str, choices=["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"],
+    parser.add_argument("--libero_task_suite", type=str, choices=["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90","libero_unseen","libero_80"],
                         help="LIBERO task suite. Example: libero_spatial", required=True)
     parser.add_argument("--libero_raw_data_dir", type=str,
                         help="Path to directory containing raw HDF5 dataset. Example: ./LIBERO/libero/datasets/libero_spatial", required=True)

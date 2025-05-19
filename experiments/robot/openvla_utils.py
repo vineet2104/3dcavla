@@ -8,11 +8,12 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+import torch.nn as nn
 import json_numpy
 import numpy as np
 import requests
 import tensorflow as tf
+import torch.nn.functional as F
 import torch
 from huggingface_hub import HfApi, hf_hub_download
 from PIL import Image
@@ -27,6 +28,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
+from prismatic.models.depth_projectors import PointNetfeat
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
@@ -42,6 +44,54 @@ OPENVLA_IMAGE_SIZE = 224  # Standard image size expected by OpenVLA
 # Configure NumPy print settings
 np.set_printoptions(formatter={"float": lambda x: "{0:0.3f}".format(x)})
 
+
+def to_3D(depth_imgs, u, v):
+        '''    
+        parameters:
+        depth_imgs: tensor of shape (B, H, W)
+        u, v: tensor of shape (H, W)
+        fx, fy, cx, cy are scalar values
+        
+        output:
+        tensor of shape (B, H, W, 3)
+        '''
+
+        fx = 309.02
+        fy = 309.02
+        cx = 128
+        cy = 128
+
+        u = u.unsqueeze(0)  
+        v = v.unsqueeze(0)  
+        
+        x = (u - cx) * depth_imgs / fx
+        y = (v - cy) * depth_imgs / fy
+        z = depth_imgs
+        
+        x = x.unsqueeze(-1)  
+        y = y.unsqueeze(-1)  
+        z = z.unsqueeze(-1)  
+        
+        return torch.cat((x, y, z), dim=-1)
+
+def make_point_cloud(depth_imgs):
+        '''    
+        parameters:
+        depth_imgs: tensor of shape (B, H, W)
+        fx, fy, cx, cy are scalar values
+        
+        output:
+        tensor of shape (B, H, W, 3)
+        '''
+        B, H, W = depth_imgs.shape
+        
+        u = torch.arange(W, device=depth_imgs.device)
+        v = torch.arange(H, device=depth_imgs.device)
+        v, u = torch.meshgrid(v, u, indexing='ij')
+        
+        xyz = to_3D(depth_imgs, u, v)
+        
+        return xyz
 
 def model_is_on_hf_hub(model_path: str) -> bool:
     """Checks whether a model path points to a model on Hugging Face Hub."""
@@ -433,6 +483,52 @@ def get_proprio_projector(cfg: Any, llm_dim: int, proprio_dim: int) -> ProprioPr
 
     return proprio_projector
 
+def get_depth_projectors(cfg: Any):
+    """
+    Get proprioception projector for the VLA model.
+
+    Args:
+        cfg: Configuration object with model parameters
+        llm_dim: Dimension of the language model
+        proprio_dim: Dimension of proprioception data
+
+    Returns:
+        ProprioProjector: The initialized proprio projector
+    """
+    # Initialize projector and move to device
+    depth_projector1 = PointNetfeat().to(DEVICE)
+    depth_projector2 = PointNetfeat().to(DEVICE)
+    depth_projector1 = depth_projector1.to(torch.bfloat16).to(DEVICE)
+    depth_projector2 = depth_projector2.to(torch.bfloat16).to(DEVICE)
+    depth_projector1.eval()
+    depth_projector2.eval()
+
+    # Find and load checkpoint (may be on Hugging Face Hub or stored locally)
+    if model_is_on_hf_hub(cfg.pretrained_checkpoint):
+        model_path_to_proprio_projector_name = {
+            "moojink/openvla-7b-oft-finetuned-libero-spatial": "proprio_projector--150000_checkpoint.pt",
+            "moojink/openvla-7b-oft-finetuned-libero-object": "proprio_projector--150000_checkpoint.pt",
+            "moojink/openvla-7b-oft-finetuned-libero-goal": "proprio_projector--50000_checkpoint.pt",
+            "moojink/openvla-7b-oft-finetuned-libero-10": "proprio_projector--150000_checkpoint.pt",
+        }
+        if cfg.pretrained_checkpoint not in model_path_to_proprio_projector_name.keys():
+            raise ValueError("Unsupported HF Hub pretrained checkpoint found!")
+        # Download proprio projector directly from HF Hub
+        proprio_projector_path = hf_hub_download(
+            repo_id=cfg.pretrained_checkpoint, filename=model_path_to_proprio_projector_name[cfg.pretrained_checkpoint]
+        )
+        state_dict = load_component_state_dict(proprio_projector_path)
+        proprio_projector.load_state_dict(state_dict)
+    else:
+        checkpoint_path1 = find_checkpoint_file(cfg.pretrained_checkpoint, "depth_projector1")
+        checkpoint_path2 = find_checkpoint_file(cfg.pretrained_checkpoint, "depth_projector2")
+        state_dict1 = load_component_state_dict(checkpoint_path1)
+        state_dict2 = load_component_state_dict(checkpoint_path2)
+        depth_projector1.load_state_dict(state_dict1)
+        depth_projector2.load_state_dict(state_dict2)
+
+    return depth_projector1,depth_projector2
+
 
 def get_noisy_action_projector(cfg: Any, llm_dim: int) -> NoisyActionProjector:
     """
@@ -716,6 +812,7 @@ def get_vla_action(
     task_label: str,
     action_head: Optional[torch.nn.Module] = None,
     proprio_projector: Optional[torch.nn.Module] = None,
+    depth_projectors_list: Optional[Tuple[torch.nn.Module]] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
 ) -> List[np.ndarray]:
@@ -730,18 +827,26 @@ def get_vla_action(
         task_label: Text description of the task
         action_head: Optional action head for continuous actions
         proprio_projector: Optional proprioception projector
+        depth_projectors_list: Optional depth projectors
         noisy_action_projector: Optional noisy action projector for diffusion
         use_film: Whether to use FiLM
 
     Returns:
         List[np.ndarray]: Predicted actions
     """
+    
+    if(cfg.use_depth):
+        depth_projector1,depth_projector2 = depth_projectors_list
+    else:
+        depth_projector1,depth_projector2 = None,None
+    
     with torch.inference_mode():
 
         # Collect all input images
+        #print(obs.keys())
         all_images = [obs["full_image"]]
         if cfg.num_images_in_input > 1:
-            all_images.extend([obs[k] for k in obs.keys() if "wrist" in k])
+            all_images.extend([obs[k] for k in obs.keys() if "wrist_image" in k])
 
         # Process images
         all_images = prepare_images_for_vla(all_images, cfg)
@@ -773,18 +878,27 @@ def get_vla_action(
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
 
+        
+        depth_maps1, depth_maps2 = None, None
+        if cfg.use_depth:
+            depth_maps1 = obs['depth_image']
+            depth_maps2 = obs['wrist_depth_image']
+
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
             action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
         else:
             # Custom action head for continuous actions
+            #print(depth_maps1,depth_maps2,depth_projector1,depth_projector2)
             action, _ = vla.predict_action(
                 **inputs,
                 unnorm_key=cfg.unnorm_key,
                 do_sample=False,
                 proprio=proprio,
                 proprio_projector=proprio_projector,
+                depth_maps = (depth_maps1,depth_maps2),
+                depth_projectors_list = (depth_projector1,depth_projector2),
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,

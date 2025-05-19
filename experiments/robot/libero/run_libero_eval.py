@@ -6,7 +6,7 @@ Evaluates a trained policy in a LIBERO simulation benchmark task suite.
 
 import json
 import logging
-import os
+import os,cv2
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -27,6 +27,8 @@ from experiments.robot.libero.libero_utils import (
     get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
+    get_libero_depth_image,
+    get_libero_wrist_depth_image,
     get_libero_wrist_image,
     quat2axisangle,
     save_rollout_video,
@@ -36,6 +38,7 @@ from experiments.robot.openvla_utils import (
     get_noisy_action_projector,
     get_processor,
     get_proprio_projector,
+    get_depth_projectors,
     resize_image_for_policy,
 )
 from experiments.robot.robot_utils import (
@@ -57,6 +60,11 @@ class TaskSuite(str, Enum):
     LIBERO_GOAL = "libero_goal"
     LIBERO_10 = "libero_10"
     LIBERO_90 = "libero_90"
+    LIBERO_UNSEEN = "libero_unseen"
+    LIBERO_GOAL_COTDEP = "libero_goal_cotdep"
+    LIBERO_10_COTDEP = "libero_10_cotdep"
+    LIBERO_SPATIAL_COTDEP = "libero_spatial_cotdep"
+    LIBERO_OBJECT_COTDEP = "libero_object_cotdep"
 
 
 # Define max steps for each task suite
@@ -66,6 +74,11 @@ TASK_MAX_STEPS = {
     TaskSuite.LIBERO_GOAL: 300,  # longest training demo has 270 steps
     TaskSuite.LIBERO_10: 520,  # longest training demo has 505 steps
     TaskSuite.LIBERO_90: 400,  # longest training demo has 373 steps
+    TaskSuite.LIBERO_UNSEEN: 520,
+    TaskSuite.LIBERO_GOAL_COTDEP: 300,
+    TaskSuite.LIBERO_10_COTDEP: 520,
+    TaskSuite.LIBERO_SPATIAL_COTDEP: 220,
+    TaskSuite.LIBERO_OBJECT_COTDEP: 280,
 }
 
 
@@ -94,7 +107,8 @@ class GenerateConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # Whether to include proprio state in input
-
+    use_depth: bool = False
+    
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
     num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
 
@@ -153,6 +167,12 @@ def initialize_model(cfg: GenerateConfig):
             model.llm_dim,
             proprio_dim=8,  # 8-dimensional proprio for LIBERO
         )
+    
+    if(cfg.use_depth):
+        depth_projector1,depth_projector2 = get_depth_projectors(cfg)
+    else:
+        depth_projector1,depth_projector2 = None,None
+    
 
     # Load action head if needed
     action_head = None
@@ -170,7 +190,7 @@ def initialize_model(cfg: GenerateConfig):
         processor = get_processor(cfg)
         check_unnorm_key(cfg, model)
 
-    return model, action_head, proprio_projector, noisy_action_projector, processor
+    return model, action_head, proprio_projector, depth_projector1,depth_projector2,noisy_action_projector, processor
 
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
@@ -237,15 +257,49 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
         return initial_states, None
 
 
-def prepare_observation(obs, resize_size):
+def prepare_observation(obs, resize_size,task_name):
     """Prepare observation for policy input."""
+
+    # path_to_roi_mask = "/scratch/vrb9107/openvla-oft/libero-goal-roi-masks/"+task_name.replace(" ","_")+"_roimask.png"
+    # roi_mask = cv2.imread(path_to_roi_mask,cv2.IMREAD_UNCHANGED)
+    # if roi_mask is None:
+    #     raise ValueError(f"Could not load image at {path_to_roi_mask}")
+
+    # mask_bin = (roi_mask // 255).astype(np.uint8)
+    # #print("mask bin shape = ",mask_bin.shape) # (256,256)
+
+
     # Get preprocessed images
     img = get_libero_image(obs)
     wrist_img = get_libero_wrist_image(obs)
+    depth_img = get_libero_depth_image(obs)
+    wrist_depth_img = get_libero_wrist_depth_image(obs)
+
+    #print("Original img shape = ",img.shape) # (256,256,3)
+    #print("Original depth shape = ",depth_img.shape) # (256,256,1)
+
+    # img = img * mask_bin [:,:,None]
+    # depth_img = depth_img * mask_bin[:,:,None]
+
+    # print("Input 3rd person depth for policy: ")
+    # print(depth_img.shape)
+    # print(depth_img.dtype)
+
+    # print("Task Description: ",task_name)
+
+    # sys.exit(0)
 
     # Resize images to size expected by model
     img_resized = resize_image_for_policy(img, resize_size)
     wrist_img_resized = resize_image_for_policy(wrist_img, resize_size)
+    depth_img_resized = resize_image_for_policy(depth_img,resize_size)
+    wrist_depth_img_resized = resize_image_for_policy(wrist_depth_img,resize_size)
+
+    
+    #print("after resizing, img shape = ",img_resized.shape) (224,224,3)
+    #print("after resizing, depth shape = ",depth_img_resized.shape) (224,224,1)
+
+
 
     # Prepare observations dict
     observation = {
@@ -254,6 +308,8 @@ def prepare_observation(obs, resize_size):
         "state": np.concatenate(
             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
         ),
+        "depth_image": depth_img_resized,
+        "wrist_depth_image": wrist_depth_img_resized
     }
 
     return observation, img  # Return both processed observation and original image for replay
@@ -281,14 +337,16 @@ def run_episode(
     processor=None,
     action_head=None,
     proprio_projector=None,
+    depth_projectors_list=None,
     noisy_action_projector=None,
     initial_state=None,
     log_file=None,
+    task_name=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
     env.reset()
-
+    print("Task description: ",task_description)
     # Set initial state if provided
     if initial_state is not None:
         obs = env.set_init_state(initial_state)
@@ -318,12 +376,13 @@ def run_episode(
                 continue
 
             # Prepare observation
-            observation, img = prepare_observation(obs, resize_size)
+            observation, img = prepare_observation(obs, resize_size,task_name)
             replay_images.append(img)
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
                 # Query model to get action
+                
                 actions = get_action(
                     cfg,
                     model,
@@ -332,6 +391,7 @@ def run_episode(
                     processor=processor,
                     action_head=action_head,
                     proprio_projector=proprio_projector,
+                    depth_projectors_list=depth_projectors_list,
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
                 )
@@ -365,6 +425,7 @@ def run_task(
     processor=None,
     action_head=None,
     proprio_projector=None,
+    depth_projectors_list=None,
     noisy_action_projector=None,
     total_episodes=0,
     total_successes=0,
@@ -379,6 +440,10 @@ def run_task(
 
     # Initialize environment and get task description
     env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
+
+    # get chain of thought steps for task description
+    task_name = task_description
+    task_description = ",".join(instruction_cot_dict[task_description])
 
     # Start episodes
     task_episodes, task_successes = 0, 0
@@ -414,9 +479,11 @@ def run_task(
             processor,
             action_head,
             proprio_projector,
+            depth_projectors_list,
             noisy_action_projector,
             initial_state,
             log_file,
+            task_name
         )
 
         # Update counters
@@ -465,8 +532,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
     set_seed_everywhere(cfg.seed)
 
     # Initialize model and components
-    model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
-
+    model, action_head, proprio_projector, depth_projector1,depth_projector2,noisy_action_projector, processor = initialize_model(cfg)
+    depth_projectors_list = (depth_projector1,depth_projector2)
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
 
@@ -475,7 +542,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[cfg.task_suite_name]()
+    task_suite = benchmark_dict[cfg.task_suite_name]()s
     num_tasks = task_suite.n_tasks
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
@@ -492,6 +559,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
             processor,
             action_head,
             proprio_projector,
+            depth_projectors_list,
             noisy_action_projector,
             total_episodes,
             total_successes,

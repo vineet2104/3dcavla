@@ -10,12 +10,13 @@ import logging
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
-
+import sys
 import numpy as np
 import timm
 import tokenizers
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformers
 from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
@@ -61,6 +62,57 @@ def ls_apply_patch(ls_module: LayerScale):
     ls_module.scale_factor = nn.Parameter(ls_module.gamma.clone())
     ls_module.forward = _ls_new_forward.__get__(ls_module, LayerScale)
     del ls_module.gamma
+
+def to_3D(depth_imgs, u, v):
+        '''    
+        parameters:
+        depth_imgs: tensor of shape (B, H, W)
+        u, v: tensor of shape (H, W)
+        fx, fy, cx, cy are scalar values
+        
+        output:
+        tensor of shape (B, H, W, 3)
+        '''
+
+        fx = 309.02
+        fy = 309.02
+        cx = 128
+        cy = 128
+
+        u = u.unsqueeze(0)  
+        v = v.unsqueeze(0)  
+        
+        x = (u - cx) * depth_imgs / fx
+        y = (v - cy) * depth_imgs / fy
+        z = depth_imgs
+        
+        x = x.unsqueeze(-1)  
+        y = y.unsqueeze(-1)  
+        z = z.unsqueeze(-1)  
+        
+        return torch.cat((x, y, z), dim=-1)
+
+def make_point_cloud(depth_imgs):
+        '''    
+        parameters:
+        depth_imgs: tensor of shape (B, H, W)
+        fx, fy, cx, cy are scalar values
+        
+        output:
+        tensor of shape (B, H, W, 3)
+        '''
+        B, H, W = depth_imgs.shape
+        
+        u = torch.arange(W, device=depth_imgs.device)
+        v = torch.arange(H, device=depth_imgs.device)
+        v, u = torch.meshgrid(v, u, indexing='ij')
+        
+        xyz = to_3D(depth_imgs, u, v)
+        
+        return xyz
+
+
+
 
 
 # === Prismatic Vision Backbone (nn.Module) Definitions (w/ Fused Backbone Support) ===
@@ -211,19 +263,26 @@ class PrismaticVisionBackbone(nn.Module):
 
             # Process each image and collect patches
             all_patches = []
+            #print(len(images)) # 2
             for img in images:
+                #print(img.shape) # (bs,6,224,224)
                 # Split each image further into two stacks of channels (each with 3 channels)
                 img_regular, img_fused = torch.split(img, [3, 3], dim=1)
 
                 # Get patches from both SigLIP and DINOv2 vision transformers
                 patches = self.featurizer(img_regular)
+                #print(patches.shape) # (bs,256,1024)
                 patches_fused = self.fused_featurizer(img_fused)
+                #print(patches_fused.shape) # (bs,256,1152)
 
                 # Concatenate SigLIP and DINOv2 patches along the hidden dimension
                 combined_patches = torch.cat([patches, patches_fused], dim=2)
+                #print(combined_patches.shape) # (bs,256,2176)
                 all_patches.append(combined_patches)
 
             # Concatenate all patches along the patch dimension
+            #print(torch.cat(all_patches,dim=1).shape) # (bs,512,2176)
+            
             return torch.cat(all_patches, dim=1)
 
 
@@ -275,6 +334,7 @@ class PrismaticCausalLMOutputWithPast(ModelOutput):
 
     # Additions for VLMs
     projector_features: Optional[torch.FloatTensor] = None
+    # depth_features: Optional ...
 
 
 class PrismaticPreTrainedModel(PreTrainedModel):
@@ -336,6 +396,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 f"use the above versions."
             )
 
+        
+
         # Instantiate PrismaticVisionBackbone (w/ Potential Fused Backbone)
         self.vision_backbone = PrismaticVisionBackbone(
             config.use_fused_vision_backbone, config.image_sizes, config.timm_model_ids, config.timm_override_act_layers
@@ -358,6 +420,16 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
         # HF Boilerplate =>> initializes weights via `_init_weights()` and sets gradient checkpointing
         self.post_init()
+
+        # Instantiate Text Aware Vision Fusion
+        # param = next(self.parameters())
+        # self.text_aware_vision_fusion = TextAwareVisionFusion(
+        #     input_dim=4096,
+        #     joint_dim=1024,
+        #     temperature=0.07,
+        #     device=param.device,  # explicitly inherit current device context (meta or otherwise)
+        #     dtype=param.dtype
+        # )
 
     # === `PreTrainedModel` Boilerplate ===
     def get_input_embeddings(self) -> nn.Module:
@@ -458,6 +530,28 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return torch.cat((projected_patch_embeddings, proprio_features), dim=1)
         return projected_patch_embeddings
 
+    def _process_depth_features(self,projected_patch_embeddings,depth_maps,depth_projector):
+        """Process depth features and append to vision features"""
+        if depth_projector is not None or depth_maps is not None:
+            #print("Are depth projectors called?")
+            depth_maps = make_point_cloud(depth_maps)
+            B,H,W,_ = depth_maps.shape
+            points = depth_maps.reshape(B,H*W,3)
+            points = points.permute(0,2,1)
+            #print("Points dtype = ",points.dtype)
+            #print("projector conv1 dtype = ",depth_projector.conv1.weight.dtype)
+            
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                point_cloud_embeddings, _, _ = depth_projector(points)
+            #point_cloud_embeddings, _, _ = depth_projector(points)
+            
+            point_cloud_embeddings  = point_cloud_embeddings.unsqueeze(1)
+            #print(projected_patch_embeddings.shape,point_cloud_embeddings.shape)
+            return torch.cat((projected_patch_embeddings, point_cloud_embeddings), dim=1)
+        else:
+            return projected_patch_embeddings
+
+
     def _build_multimodal_attention(self, input_embeddings, projected_patch_embeddings, attention_mask):
         """Build multimodal embeddings and attention mask"""
         # Update attention mask
@@ -495,7 +589,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return torch.cat([labels[:, :1], projected_patch_labels, labels[:, 1:]], dim=1)
         return None
 
-    # === Core Prismatic VLM `forward()` Logic ===
+    # === Core Prismatic VLM `forward()` Logic === Forward pass for OpenVLA-OFT
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -511,10 +605,13 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         return_dict: Optional[bool] = None,
         proprio=None,
         proprio_projector=None,
+        depth_maps = None,
+        depth_projectors_list=None,
         noisy_actions=None,
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
+        use_depth: bool = False,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -526,6 +623,12 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
         # Respect `use_cache` only if not training (even if `gradient_checkpointing` is off)
         use_cache = use_cache and not self.training
+
+        if(depth_projectors_list is not None):
+            depth_projector1,depth_projector2 = depth_projectors_list
+            depth_map1,depth_map2 = depth_maps
+        else:
+            depth_projector1,depth_projector2,depth_map1,depth_map2 = None,None,None,None
 
         # Instantiate Placeholder for Projector Features
         projected_patch_embeddings = None
@@ -569,6 +672,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
         # === Handle Multimodal Forward ===
         elif (input_ids.shape[0] == pixel_values.shape[0]) or (inputs_embeds.shape[0] == pixel_values.shape[0]):
+            #print("Forward pass of OpenVLA-OFT")
             assert past_key_values is None, "Unexpected key `past_key_values` provided during multimodal forward!"
 
             # Get input embeddings (from language model embeddings)
@@ -580,15 +684,38 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             # Extract the language portion of the input embeddings (i.e. remove the action tokens portion)
             language_embeddings = input_embeddings[~all_actions_mask].reshape(
                 input_embeddings.shape[0], -1, input_embeddings.shape[2]
-            )  # (B, lang_seq_len, llm_dim)
+            )  # (B, lang_seq_len, llm_dim) (bs,34,4096)
 
             # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film) # (8,512,4096)
+
+            # Text aware vision fusion
+            #print("Is this even used???")
+            #vis_text_attn_mask,text_proj_embed,vision_proj_embed = self.text_aware_vision_fusion(language_embeddings,projected_patch_embeddings)
+            #projected_patch_embeddings = projected_patch_embeddings * vis_text_attn_mask.unsqueeze(-1)
+            #contrastive_loss_vis_text_proj = self.text_aware_vision_fusion.contrastive_loss(text_proj_embed,vision_proj_embed)
+            contrastive_loss_vis_text_proj = 0
 
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
             )
+
+            #print("Shape of projected patch embeddings after proprioception = ",projected_patch_embeddings.shape) # (bs,513,4096)
+            #print("Depth map shape before input to PointNet: ",depth_map1.shape)  # (bs,224,224)
+            # Add depth features if provided
+            projected_patch_embeddings = self._process_depth_features(
+                projected_patch_embeddings, depth_map1, depth_projector1
+            )
+
+            #print("Shape of projected patch embeddings after proprioception and depth features 1= ",projected_patch_embeddings.shape) # (bs,514,4096)
+
+            # Add depth features if provided
+            projected_patch_embeddings = self._process_depth_features(
+                projected_patch_embeddings, depth_map2, depth_projector2
+            )
+
+            # print("Shape of projected patch embeddings after proprioception and depth features 1 & 2= ",projected_patch_embeddings.shape) # (bs,515,4096)
 
             # [Diffusion] Add diffusion timestep embedding if provided
             if diffusion_timestep_embeddings is not None:
@@ -949,11 +1076,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         unnorm_key: Optional[str] = None,
         proprio=None,
         proprio_projector=None,
+        depth_maps = None,
+        depth_projectors_list = None,
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
         **kwargs: str,
-    ) -> np.ndarray:
+    ) -> np.ndarray: # Used for evaluation
         """Predict actions from input sequence, with options for different prediction methods.
 
         Args:
@@ -969,6 +1098,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         Returns:
             Tuple of (unnormalized_actions, action_hidden_states)
         """
+
+        
+
+
         # If the special empty token ('') does not already appear after the colon (':') token in the prompt
         # (after "OUT:" or "ASSISTANT:"), insert it to match the inputs seen at training time
         if not torch.all(input_ids[:, -1] == 29871):
@@ -1002,8 +1135,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
 
+        
+        
+        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
         if use_proprio:
@@ -1012,6 +1148,36 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 projected_patch_embeddings, proprio, proprio_projector
             )
 
+        
+        use_depth = (
+            depth_projectors_list is not None
+            and depth_maps is not None
+            and all(x is not None for x in depth_projectors_list)
+            and all(x is not None for x in depth_maps)
+        )
+        #print("use depth = ",use_depth)
+        if use_depth:
+            depth_map1,depth_map2 = depth_maps
+            
+            depth_map1 = torch.Tensor(depth_map1).to(projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype)
+            depth_map2 = torch.Tensor(depth_map2).to(projected_patch_embeddings.device, dtype=projected_patch_embeddings.dtype)
+
+            depth_map1 = depth_map1.permute(2,0,1)
+            depth_map2 = depth_map2.permute(2,0,1)
+            #print("Depth map shape before input to PointNet: ",depth_map1.shape,depth_map2.shape)
+            depth_projector1,depth_projector2 = depth_projectors_list
+
+            projected_patch_embeddings = self._process_depth_features(
+                projected_patch_embeddings,depth_map1,depth_projector1)
+            
+            projected_patch_embeddings = self._process_depth_features(
+                projected_patch_embeddings,depth_map2,depth_projector2)
+            
+        
+        #print("Is there an error here??")
+            
+        
+
         # Use diffusion if provided, otherwise use regression or discrete prediction
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
 
@@ -1019,6 +1185,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
         if use_proprio:
             NUM_PATCHES += 1
+        if use_depth:
+            NUM_PATCHES +=2
         if use_diffusion:
             NUM_PATCHES += 1
 

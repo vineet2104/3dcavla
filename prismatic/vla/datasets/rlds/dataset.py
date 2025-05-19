@@ -393,6 +393,8 @@ def apply_frame_transforms(
         num_parallel_calls (int): number of parallel calls for frame_map operations. Default to AUTOTUNE.
     """
 
+    depth_resize_size = resize_size
+
     # Convenience wrapper that takes a function that operates on a non-chunked "observation" dict and applies
     # it to the chunked "observation" dict as well as the non-chunked "task" dict
     def apply_obs_transform(fn: Callable[[Dict], Dict], frame: Dict) -> Dict:

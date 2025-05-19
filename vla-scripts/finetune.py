@@ -1,9 +1,9 @@
 """
 finetune.py
 
-Fine-tunes OpenVLA via LoRA.
+Fine-tunes 3D-CAVLA via LoRA.
 """
-
+import sys
 import os
 import time
 from collections import deque
@@ -15,6 +15,7 @@ import draccus
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import tqdm
 from accelerate import PartialState
 from huggingface_hub import HfApi, snapshot_download
@@ -27,6 +28,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
+wandb.init(project="3dcavla-oft-experiments")
 
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
@@ -44,6 +46,8 @@ from prismatic.models.projectors import (
     NoisyActionProjector,
     ProprioProjector,
 )
+from prismatic.models.depth_projectors import PointNetfeat
+
 from prismatic.training.train_utils import (
     compute_actions_l1_loss,
     compute_token_accuracy,
@@ -83,8 +87,11 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    use_depth: bool = False                          # If True, uses depth map from both cameras and passes through PointNet style projectors
+    use_cot: bool = False                            # If True, uses CoT style task instructions instead of a single sentence
 
     # Training configuration
+    
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
     learning_rate: float = 5e-4                      # Learning rate
     lr_warmup_steps: int = 0                         # Number of steps to warm up learning rate (from 10% to 100%)
@@ -271,12 +278,14 @@ def run_forward_pass(
     action_head,
     noisy_action_projector,
     proprio_projector,
+    depth_projectors_list,
     batch,
     action_tokenizer,
     device_id,
     use_l1_regression,
     use_diffusion,
     use_proprio,
+    use_depth,
     use_film,
     num_patches,
     compute_diffusion_l1=False,
@@ -290,6 +299,7 @@ def run_forward_pass(
         action_head (nn.Module): Action head module.
         noisy_action_projector (nn.Module): Noisy action projector module (only used for diffusion).
         proprio_projector (nn.Module): Proprioceptive state projector module.
+        depth_projectors (Tuple of nn.Module): Depth map Pointnet projector modules.
         batch (dict): Input batch.
         action_tokenizer (ActionTokenizer): Action tokenizer.
         device_id (str): Device ID.
@@ -323,8 +333,21 @@ def run_forward_pass(
     else:
         noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
 
+    if(use_depth):
+        depth_projector1,depth_projector2 = depth_projectors_list
+
     # VLA forward pass
     with torch.autocast("cuda", dtype=torch.bfloat16):
+        # print("Input data for VLA forward pass:")
+        # print("pixel_values = ",batch['pixel_values'].shape) # (bs,12,224,224)
+        # print("input_ids = ",batch['input_ids'].shape) # (bs,93)
+        # print("labels = ",batch['labels'].shape) # (bs,93)
+        # print("actions = ",batch['actions'].shape) # (bs,8,7)
+        # print("lang = ",batch["lang"]) # list of 8 task instructions
+
+        #print("Check if depth is contained: ",batch['depth_maps'].shape) # (bs,224,224)
+        #print("Check if wrist depth is contained: ",batch['depth_maps_wrist'].shape) # (bs,224,224)
+        
         output: CausalLMOutputWithPast = vla(
             input_ids=batch["input_ids"].to(device_id),
             attention_mask=batch["attention_mask"].to(device_id),
@@ -333,11 +356,15 @@ def run_forward_pass(
             output_hidden_states=True,
             proprio=batch["proprio"] if use_proprio else None,
             proprio_projector=proprio_projector if use_proprio else None,
+            depth_maps = (batch['depth_maps'],batch['depth_maps_wrist']) if use_depth else None,
+            depth_projectors_list = (depth_projector1,depth_projector2) if use_depth else None,
             noisy_actions=noisy_actions if use_diffusion else None,
             noisy_action_projector=noisy_action_projector if use_diffusion else None,
             diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
             use_film=use_film,
         )
+
+        #print("Forward pass complete!!!!")
 
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
@@ -383,14 +410,19 @@ def run_forward_pass(
             .to(torch.bfloat16)
         )  # (B, act_chunk_len, D)
 
-        if use_l1_regression:
+        if use_l1_regression: # This is used in default
             # Predict action
+            #print("Using L1 regression")
             predicted_actions = action_head.module.predict_action(actions_hidden_states)
             # Get full L1 loss
             loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+            #print("L1 loss: ",loss)
+            loss = loss
+            #print("Loss = ",loss)
 
         if use_diffusion:
             # Predict noise
+            print("Using Diffusion")
             noise_pred = action_head.module.predict_noise(actions_hidden_states)
             # Get diffusion noise prediction MSE loss
             noise_pred = noise_pred.reshape(noise.shape)
@@ -578,6 +610,7 @@ def save_training_checkpoint(
     vla,
     processor,
     proprio_projector,
+    depth_projectors_list,
     noisy_action_projector,
     action_head,
     train_dataset,
@@ -630,6 +663,12 @@ def save_training_checkpoint(
         # Save other components
         if cfg.use_proprio and proprio_projector is not None:
             torch.save(proprio_projector.state_dict(), checkpoint_dir / f"proprio_projector--{checkpoint_name_suffix}")
+        
+        if cfg.use_depth and depth_projectors_list is not None:
+            depth_projector1,depth_projector2 = depth_projectors_list
+            torch.save(depth_projector1.state_dict(), checkpoint_dir / f"depth_projector1--{checkpoint_name_suffix}")
+            torch.save(depth_projector2.state_dict(), checkpoint_dir / f"depth_projector2--{checkpoint_name_suffix}")
+
 
         if cfg.use_diffusion and noisy_action_projector is not None:
             torch.save(
@@ -790,6 +829,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
+        print("Initialization wandb")
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{run_id}")
 
     # Print detected constants
@@ -839,6 +879,13 @@ def finetune(cfg: FinetuneConfig) -> None:
         trust_remote_code=True,
     ).to(device_id)
 
+    # vla.text_aware_vision_fusion = TextAwareVisionFusion(
+    #     input_dim=4096,
+    #     joint_dim=1024,
+    #     temperature=0.07,
+    #     dtype=torch.bfloat16
+    # ).to(device_id)
+
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
@@ -884,6 +931,23 @@ def finetune(cfg: FinetuneConfig) -> None:
             {"llm_dim": vla.module.llm_dim, "proprio_dim": PROPRIO_DIM},
         )
 
+    # If applicable, instantiate depth projector
+    if cfg.use_depth:
+        depth_projector1 = init_module(
+            PointNetfeat,
+            'depth_projector',
+            cfg,
+            device_id,
+            {},
+        )
+        depth_projector2 = init_module(
+            PointNetfeat,
+            'depth_projector',
+            cfg,
+            device_id,
+            {},
+        )
+
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
         action_head = init_module(
@@ -919,6 +983,9 @@ def finetune(cfg: FinetuneConfig) -> None:
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
     if cfg.use_proprio:
         NUM_PATCHES += 1
+    # If we have depth inputs, two depth embedding is appended to the end of the vision patch embeddings (for 3rd person camera and gripper camera)
+    if cfg.use_depth:
+        NUM_PATCHES += 2
     # For diffusion, a single diffusion timestep embedding is appended to the end of the vision patch embeddings
     if cfg.use_diffusion:
         NUM_PATCHES += 1
@@ -931,6 +998,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         trainable_params += [param for param in noisy_action_projector.parameters() if param.requires_grad]
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+    if cfg.use_depth:
+        trainable_params += [param for param in depth_projector1.parameters() if param.requires_grad]
+        trainable_params += [param for param in depth_projector2.parameters() if param.requires_grad]
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
@@ -1040,12 +1110,14 @@ def finetune(cfg: FinetuneConfig) -> None:
                 action_head=action_head,
                 noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
+                depth_projectors_list = (depth_projector1,depth_projector2) if cfg.use_depth else None,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
                 use_l1_regression=cfg.use_l1_regression,
                 use_diffusion=cfg.use_diffusion,
                 use_proprio=cfg.use_proprio,
+                use_depth=cfg.use_depth,
                 use_film=cfg.use_film,
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
@@ -1072,6 +1144,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
+                #print("Is this even called for fucks sake??")
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
@@ -1107,6 +1180,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     vla=vla,
                     processor=processor,
                     proprio_projector=proprio_projector if cfg.use_proprio else None,
+                    depth_projectors_list = (depth_projector1,depth_projector2) if cfg.use_depth else None,
                     noisy_action_projector=noisy_action_projector if cfg.use_diffusion else None,
                     action_head=action_head if (cfg.use_l1_regression or cfg.use_diffusion) else None,
                     train_dataset=train_dataset,

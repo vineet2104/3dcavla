@@ -924,7 +924,14 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "libero_object_no_noops": libero_dataset_transform,
     "libero_goal_no_noops": libero_dataset_transform,
     "libero_10_no_noops": libero_dataset_transform,
+    "libero_80_no_noops": libero_dataset_transform,
     "libero_4_task_suites_no_noops": libero_dataset_transform,
+    # Add new COT-DEP datasets
+    "libero_10_cotdep": libero_dataset_transform,
+    "libero_spatial_cotdep": libero_dataset_transform,
+    "libero_object_cotdep": libero_dataset_transform,
+    "libero_goal_cotdep": libero_dataset_transform,
+    "libero_unseen": libero_dataset_transform,
     ### ALOHA fine-tuning datasets
     "aloha1_fold_shorts_20_demos": aloha_dataset_transform,
     "aloha1_fold_shirt_30_demos": aloha_dataset_transform,

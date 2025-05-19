@@ -3,7 +3,7 @@
 import os
 import random
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union,Tuple
 
 import numpy as np
 import torch
@@ -104,6 +104,7 @@ def get_action(
     processor: Optional[Any] = None,
     action_head: Optional[torch.nn.Module] = None,
     proprio_projector: Optional[torch.nn.Module] = None,
+    depth_projectors_list: Optional[Tuple[torch.nn.Module]] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
 ) -> Union[List[np.ndarray], np.ndarray]:
@@ -118,6 +119,7 @@ def get_action(
         processor: Model processor for inputs
         action_head: Optional action head for continuous actions
         proprio_projector: Optional proprioception projector
+        depth_projectors_list: Optional depth projectors
         noisy_action_projector: Optional noisy action projector for diffusion
         use_film: Whether to use FiLM
 
@@ -127,6 +129,9 @@ def get_action(
     Raises:
         ValueError: If model family is not supported
     """
+
+    
+
     with torch.no_grad():
         if cfg.model_family == "openvla":
             action = get_vla_action(
@@ -137,6 +142,7 @@ def get_action(
                 task_label=task_label,
                 action_head=action_head,
                 proprio_projector=proprio_projector,
+                depth_projectors_list = depth_projectors_list,
                 noisy_action_projector=noisy_action_projector,
                 use_film=use_film,
             )

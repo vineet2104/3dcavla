@@ -87,13 +87,16 @@ def decode_and_resize(
             if tf.strings.length(depth) == 0:
                 depth = tf.zeros((*depth_resize_size.get(name, (1, 1)), 1), dtype=tf.float32)
             else:
-                depth = tf.io.decode_image(depth, expand_animations=False, dtype=tf.float32)[..., 0]
+                decoded = tf.io.decode_png(depth, channels=4, dtype=tf.uint8)
+                depth = tf.bitcast(decoded, tf.float32)
+                depth = tf.ensure_shape(depth, [decoded.shape[0], decoded.shape[1]])
+                depth = depth[..., tf.newaxis]
         elif depth.dtype != tf.float32:
             raise ValueError(f"Unsupported depth dtype: found depth_{name} with dtype {depth.dtype}")
 
         if name in depth_resize_size:
             depth = dl.transforms.resize_depth_image(depth, size=depth_resize_size[name])
 
-        obs[f"depth_{name}"] = depth
+        obs[f"depth_{name}"] = depth[...,0]
 
     return obs

@@ -19,7 +19,7 @@ def get_libero_env(task, model_family, resolution=256):
     """Initializes and returns the LIBERO environment, along with the task description."""
     task_description = task.language
     task_bddl_file = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
-    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution}
+    env_args = {"bddl_file_name": task_bddl_file, "camera_heights": resolution, "camera_widths": resolution,"camera_depths":True}
     env = OffScreenRenderEnv(**env_args)
     env.seed(0)  # IMPORTANT: seed seems to affect object positions even when using fixed initial state
     return env, task_description
@@ -43,13 +43,33 @@ def get_libero_wrist_image(obs):
     img = img[::-1, ::-1]  # IMPORTANT: rotate 180 degrees to match train preprocessing
     return img
 
+def get_libero_depth_image(obs):
+
+    if "agentview_depth" not in obs:
+        raise KeyError("Missing 'agentview_depth' in observations")
+
+    depth_img = obs["agentview_depth"]
+    depth_img = depth_img[::-1, ::-1]  # rotate 180 degrees to match RGB preprocessing
+    return depth_img
+
+def get_libero_wrist_depth_image(obs):
+
+    if "robot0_eye_in_hand_depth" not in obs:
+        raise KeyError("Missing 'robot0_eye_in_hand_depth' in observations")
+
+    depth_img = obs["robot0_eye_in_hand_depth"]
+    depth_img = depth_img[::-1, ::-1]  # rotate 180 degrees to match RGB preprocessing
+    return depth_img
+
 
 def save_rollout_video(rollout_images, idx, success, task_description, log_file=None):
     """Saves an MP4 replay of an episode."""
     rollout_dir = f"./rollouts/{DATE}"
+    #rollout_dir = f"./rollouts/libero-80"
     os.makedirs(rollout_dir, exist_ok=True)
     processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
     mp4_path = f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}.mp4"
+    #mp4_path = f"{rollout_dir}/episode={idx}--success={success}--{task_description}.mp4"
     video_writer = imageio.get_writer(mp4_path, fps=30)
     for img in rollout_images:
         video_writer.append_data(img)

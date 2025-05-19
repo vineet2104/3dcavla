@@ -38,7 +38,10 @@ class RLDSBatchTransform:
         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
         img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
-        actions = rlds_batch["action"]
+        actions = rlds_batch['action']
+
+        # Capture 3rd person depth
+        depth = rlds_batch["observation"]["depth_primary"][0]
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
@@ -66,24 +69,31 @@ class RLDSBatchTransform:
         # Tensorize =>> Run Image Transform to get `pixel_values` =>> Return
         #   =>> IMPORTANT :: IF WE'RE USING HF LLM.forward(..., labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
         input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
+        #print("Original image shape = ",img.size())
         pixel_values = self.image_transform(img)
+        #print("Pixel values shape after image transform: ",pixel_values.size())
 
         # [CRITICAL] We do not want to take the loss for anything but the predicted action tokens!
         labels[: -(action_chunk_len + 1)] = IGNORE_INDEX
         if not self.predict_stop_token:
             labels[-1] = IGNORE_INDEX
 
-        return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
+        return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions,lang=lang,depth_map=np.squeeze(depth))
+        #return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions,depth_map=np.squeeze(depth))
 
         # Add additional inputs
         if self.use_wrist_image:
+            #print("Keys in rlds batch observation: ",rlds_batch['observation'].keys())
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
-                if "wrist" in k:
+                if "image_wrist" in k:
                     img_wrist = Image.fromarray(rlds_batch["observation"][k][0])
                     pixel_values_wrist = self.image_transform(img_wrist)
                     all_wrist_pixels.append(pixel_values_wrist)
+                if "depth_wrist" in k:
+                    depth_wrist = rlds_batch['observation'][k][0]
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
+            return_dict['depth_map_wrist'] = np.squeeze(depth_wrist)
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
             return_dict["proprio"] = proprio
@@ -122,7 +132,7 @@ class RLDSDataset(IterableDataset):
             self.data_root_dir,
             mixture_spec,
             load_camera_views=load_camera_views,
-            load_depth=False,
+            load_depth=True,
             load_proprio=True,
             load_language=True,
             action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,

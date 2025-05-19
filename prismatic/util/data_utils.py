@@ -100,8 +100,11 @@ class PaddedCollatorForActionPrediction:
     pixel_values_dtype: torch.dtype = torch.float32
 
     def __call__(self, instances: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        lang = [instance['lang'] for instance in instances]
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
         pixel_values = [instance["pixel_values"] for instance in instances]
+        depth_maps = [instance["depth_map"] for instance in instances]  # Extract `depth_map`
+        depth_maps_wrist = [instance["depth_map_wrist"] for instance in instances]  # Extract `depth_map_wrist`
         if "dataset_name" in instances[0]:
             dataset_names = [instance["dataset_name"] for instance in instances]
         else:
@@ -143,6 +146,13 @@ class PaddedCollatorForActionPrediction:
         else:
             proprio = None
 
+        # Stack all `depth_maps`
+        depth_maps = [torch.tensor(dm, dtype=torch.float32) for dm in depth_maps]  # Convert to torch.Tensor
+        depth_maps = torch.stack(depth_maps)
+
+        depth_maps_wrist = [torch.tensor(dm, dtype=torch.float32) for dm in depth_maps_wrist]  # Convert to torch.Tensor
+        depth_maps_wrist = torch.stack(depth_maps_wrist)
+
         output = dict(
             pixel_values=pixel_values,
             proprio=proprio,
@@ -150,6 +160,9 @@ class PaddedCollatorForActionPrediction:
             attention_mask=attention_mask,
             labels=labels,
             actions=actions,
+            lang = lang,
+            depth_maps=depth_maps,
+            depth_maps_wrist = depth_maps_wrist,
         )
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
