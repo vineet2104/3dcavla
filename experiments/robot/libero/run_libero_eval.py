@@ -6,7 +6,7 @@ Evaluates a trained policy in a LIBERO simulation benchmark task suite.
 
 import json
 import logging
-import os,cv2
+import os
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -32,6 +32,7 @@ from experiments.robot.libero.libero_utils import (
     get_libero_wrist_image,
     quat2axisangle,
     save_rollout_video,
+    instruction_cot_dict,
 )
 from experiments.robot.openvla_utils import (
     get_action_head,
@@ -260,14 +261,6 @@ def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=
 def prepare_observation(obs, resize_size,task_name):
     """Prepare observation for policy input."""
 
-    # path_to_roi_mask = "/scratch/vrb9107/openvla-oft/libero-goal-roi-masks/"+task_name.replace(" ","_")+"_roimask.png"
-    # roi_mask = cv2.imread(path_to_roi_mask,cv2.IMREAD_UNCHANGED)
-    # if roi_mask is None:
-    #     raise ValueError(f"Could not load image at {path_to_roi_mask}")
-
-    # mask_bin = (roi_mask // 255).astype(np.uint8)
-    # #print("mask bin shape = ",mask_bin.shape) # (256,256)
-
 
     # Get preprocessed images
     img = get_libero_image(obs)
@@ -275,29 +268,11 @@ def prepare_observation(obs, resize_size,task_name):
     depth_img = get_libero_depth_image(obs)
     wrist_depth_img = get_libero_wrist_depth_image(obs)
 
-    #print("Original img shape = ",img.shape) # (256,256,3)
-    #print("Original depth shape = ",depth_img.shape) # (256,256,1)
-
-    # img = img * mask_bin [:,:,None]
-    # depth_img = depth_img * mask_bin[:,:,None]
-
-    # print("Input 3rd person depth for policy: ")
-    # print(depth_img.shape)
-    # print(depth_img.dtype)
-
-    # print("Task Description: ",task_name)
-
-    # sys.exit(0)
-
     # Resize images to size expected by model
     img_resized = resize_image_for_policy(img, resize_size)
     wrist_img_resized = resize_image_for_policy(wrist_img, resize_size)
     depth_img_resized = resize_image_for_policy(depth_img,resize_size)
     wrist_depth_img_resized = resize_image_for_policy(wrist_depth_img,resize_size)
-
-    
-    #print("after resizing, img shape = ",img_resized.shape) (224,224,3)
-    #print("after resizing, depth shape = ",depth_img_resized.shape) (224,224,1)
 
 
 
@@ -443,7 +418,8 @@ def run_task(
 
     # get chain of thought steps for task description
     task_name = task_description
-    task_description = ",".join(instruction_cot_dict[task_description])
+    if(cfg.use_depth): # If flag is True then use chain-of-thought instructions and depth
+        task_description = ",".join(instruction_cot_dict[task_description])
 
     # Start episodes
     task_episodes, task_successes = 0, 0
