@@ -1,5 +1,7 @@
 # 3D CAVLA: Leveraging Depth and 3D Context to Generalize Vision Language Action Models for Unseen Tasks
 
+<p align="center"><strong><em>Accepted at the 3D LLM/VLA Workshop @ CVPR 2025</em></strong></p>
+
 🔗 **Project Website**: https://3d-cavla.github.io
 
 📄 **Paper**: https://arxiv.org/abs/2505.05800v1
