@@ -17,6 +17,11 @@ from typing import Optional, Union
 import draccus
 import numpy as np
 import tqdm
+current_dir = os.path.dirname(os.path.abspath(__file__))  # .../experiments/robot/libero
+project_root = os.path.abspath(os.path.join(current_dir, "../../../"))  # .../3dcavla
+libero_path = os.path.join(project_root, "LIBERO")
+
+sys.path.append(libero_path)
 from libero.libero import benchmark
 
 import wandb
@@ -518,7 +523,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[cfg.task_suite_name]()s
+    task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks = task_suite.n_tasks
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
