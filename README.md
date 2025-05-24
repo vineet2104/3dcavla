@@ -55,13 +55,38 @@ pip install -e .
 pip install packaging ninja
 ninja --version; echo $?  # Should return 0 if installed correctly
 pip install "flash-attn==2.5.5" --no-build-isolation
+
+# Additional dependencies for LIBERO experiments
+pip install bddl easydict cloudpickle gym
+pip install robosuite==1.4.0
+pip install imageio[ffmpeg]
 ```
 
 ---
 
-## Dataset Download
+## LIBERO Configuration File
 
-We use a modified version of the LIBERO dataset adapted for causal action-aware training. You can download it from Hugging Face:
+Before running training or testing, update the LIBERO config file. After cloning this repo, you can find the file at:
+
+```
+../.libero/config.yaml
+```
+
+Edit the file so it looks like this (replace `<path_to_local_3dcavla>` with your local path):
+
+```yaml
+assets: <path_to_local_3dcavla>/LIBERO/libero/libero/./assets
+bddl_files: <path_to_local_3dcavla>/LIBERO/libero/libero/./bddl_files
+benchmark_root: <path_to_local_3dcavla>/LIBERO/libero/libero
+datasets: <path_to_local_3dcavla>LIBERO/libero/libero/../datasets
+init_states: <path_to_local_3dcavla>LIBERO/libero/libero/./init_files
+```
+
+---
+
+## Dataset Download (~293 GB)
+
+We use a modified version of the LIBERO dataset with depth maps. You can download it from Hugging Face:
 
 ```bash
 git lfs install
@@ -112,3 +137,7 @@ If you use this codebase, please cite:
 Parts of this codebase build on [OpenVLA-OFT](https://github.com/moojink/openvla-oft) and [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO). The `LIBERO/` folder is included in this repo with minor environment modifications for compatibility and reproducibility.
 
 ---
+
+
+
+
