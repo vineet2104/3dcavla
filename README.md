@@ -120,13 +120,11 @@ bash test.sh
 If you use this codebase, please cite:
 
 ```bibtex
-@inproceedings{
-  bhat2025dcavla,
-  title={3D-{CAVLA}: Leveraging Depth and 3D Context to Generalize Vision{\textendash}Language Action Models for Unseen Tasks},
-  author={Vineet Bhat and Yu-Hsiang Lan and Prashanth Krishnamurthy and Ramesh Karri and Farshad Khorrami},
-  booktitle={CVPR 2025 Workshop on 3D-LLM/VLA: Bridging Language, Vision and Action in 3D Environments},
-  year={2025},
-  url={https://openreview.net/forum?id=hn2VHDr95j}
+@article{bhat20253d,
+  title={3D CAVLA: Leveraging Depth and 3D Context to Generalize Vision Language Action Models for Unseen Tasks},
+  author={Bhat, Vineet and Lan, Yu-Hsiang and Krishnamurthy, Prashanth and Karri, Ramesh and Khorrami, Farshad},
+  journal={arXiv preprint arXiv:2505.05800},
+  year={2025}
 }
 ```
 
