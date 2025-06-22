@@ -690,15 +690,16 @@ def save_training_checkpoint(
     # Merge LoRA weights into base model and save resulting model checkpoint
     # Note: Can be very slow on some devices; if so, we recommend merging offline
     if cfg.use_lora and cfg.merge_lora_during_training:
-        base_vla = AutoModelForVision2Seq.from_pretrained(
-            cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
-        )
-        merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
-        merged_vla = merged_vla.merge_and_unload()
-
         if distributed_state.is_main_process:
+            
+            base_vla = AutoModelForVision2Seq.from_pretrained(
+                cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
+            )
+            merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)
+            merged_vla = merged_vla.merge_and_unload()
+
             merged_vla.save_pretrained(checkpoint_dir)
-            print(f"Saved merged model for Step {log_step} at: {checkpoint_dir}")
+            print(f"Saved merged model for Step {log_step} at: {checkpoint_dir})
 
         # Wait for merged model to be saved
         dist.barrier()
